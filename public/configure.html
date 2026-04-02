@@ -264,6 +264,43 @@ iframe[id*="kofi-wo-container"] {
       </div>
       
       <div class="field-group">
+        <label class="description-after">Preferred Audio Language</label>
+        <small>Streams with this language will be sorted first</small>
+        <select name="preferredLanguage" id="preferredLanguage" style="width:100%;padding:.65rem .8rem;border-radius:8px;border:1px solid #334155;background:#0f1722;color:var(--text);font-size:.95rem;">
+          <option value="">None (default order)</option>
+          <option value="eng">English</option>
+          <option value="spa">Spanish</option>
+          <option value="fre">French</option>
+          <option value="ger">German</option>
+          <option value="ita">Italian</option>
+          <option value="por">Portuguese</option>
+          <option value="rus">Russian</option>
+          <option value="jpn">Japanese</option>
+          <option value="kor">Korean</option>
+          <option value="chi">Chinese</option>
+          <option value="hin">Hindi</option>
+          <option value="ara">Arabic</option>
+          <option value="tur">Turkish</option>
+          <option value="pol">Polish</option>
+          <option value="dut">Dutch</option>
+          <option value="swe">Swedish</option>
+          <option value="nor">Norwegian</option>
+          <option value="dan">Danish</option>
+          <option value="fin">Finnish</option>
+          <option value="cze">Czech</option>
+          <option value="hun">Hungarian</option>
+          <option value="rum">Romanian</option>
+          <option value="tha">Thai</option>
+          <option value="vie">Vietnamese</option>
+          <option value="ind">Indonesian</option>
+          <option value="may">Malay</option>
+          <option value="ukr">Ukrainian</option>
+          <option value="heb">Hebrew</option>
+          <option value="gre">Greek</option>
+        </select>
+      </div>
+      
+      <div class="field-group">
         <label class="description-after">Hide Stream Types</label>
         <small>Check types to hide from results</small>
         <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:0.6rem;margin-top:0.5rem;">
@@ -553,6 +590,11 @@ $("#cfg").addEventListener("submit",e=>{
   // includeSubtitles: only set when user opts out (unchecked). Omit when checked for backward compatibility (default = include).
   if (formData.get("includeSubtitles") === null || formData.get("includeSubtitles") === undefined) {
     cfg.includeSubtitles = false;
+  }
+
+  const preferredLanguage = formData.get("preferredLanguage");
+  if (preferredLanguage && preferredLanguage.trim()) {
+    cfg.preferredLanguage = preferredLanguage.trim();
   }
 
   const cfg64=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))))

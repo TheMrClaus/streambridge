@@ -4,6 +4,7 @@
  * User data is embedded in the URL path as a base64-url string.
  */
 
+const crypto       = require("crypto");
 const express      = require("express");
 const path         = require("path");
 const cors         = require("cors");
@@ -101,8 +102,12 @@ function baseManifest () {
     name    : "StreamBridge: Emby to Stremio",
     description:
       "Stream media from your Emby server using IMDb/TMDB/Tvdb/Anidb IDs.",
-    catalogs : [],
+    catalogs : [
+      { type: "movie", id: "continue-watching-movies", name: "Continue Watching" },
+      { type: "series", id: "continue-watching-series", name: "Continue Watching" }
+    ],
     resources: [
+      "catalog",
       { name: "stream",
         types: ["movie", "series"],
         idPrefixes: ["tt", "imdb:", "tmdb:"] }
@@ -122,22 +127,49 @@ function baseManifest () {
 // ──────────────────────────────────────────────────────────────────────────
 function decodeCfg(str) {
   const cfg = JSON.parse(Buffer.from(str, "base64url").toString("utf8"));
-  
-  // Normalize serverUrl: remove trailing slash to prevent double slashes in API calls
-  if (cfg.serverUrl) {
-    cfg.serverUrl = cfg.serverUrl.replace(/\/+$/, '');
+
+  // --- Validate required fields ---
+  if (typeof cfg.serverUrl !== "string" || !cfg.serverUrl.trim()) {
+    throw new Error("Invalid config: serverUrl must be a non-empty string");
   }
-  
-  // Set defaults for new features to maintain backward compatibility
-  // If these fields don't exist, use sensible defaults
-  if (!cfg.serverType) cfg.serverType = 'emby'; // Default: Emby for backward compatibility
-  if (cfg.showServerName === undefined) cfg.showServerName = false; // Default: hide server name
-  if (!cfg.streamName) {
-    // Default stream name based on server type
-    cfg.streamName = cfg.serverType === 'jellyfin' ? 'Jellyfin' : 'Emby';
+  if (!/^https?:\/\//i.test(cfg.serverUrl)) {
+    throw new Error("Invalid config: serverUrl must start with http:// or https://");
   }
-  if (!cfg.hideStreamTypes) cfg.hideStreamTypes = []; // Default: show all stream types
-  
+  if (typeof cfg.userId !== "string" || !cfg.userId.trim()) {
+    throw new Error("Invalid config: userId must be a non-empty string");
+  }
+  if (typeof cfg.accessToken !== "string" || !cfg.accessToken.trim()) {
+    throw new Error("Invalid config: accessToken must be a non-empty string");
+  }
+
+  cfg.serverUrl = cfg.serverUrl.replace(/\/+$/, '');
+
+  // --- Validate optional fields (coerce invalid values to safe defaults) ---
+  const VALID_SERVER_TYPES = ["emby", "jellyfin"];
+  if (!VALID_SERVER_TYPES.includes(cfg.serverType)) cfg.serverType = "emby";
+  if (typeof cfg.showServerName !== "boolean") cfg.showServerName = false;
+  if (typeof cfg.streamName !== "string" || !cfg.streamName.trim()) {
+    cfg.streamName = cfg.serverType === "jellyfin" ? "Jellyfin" : "Emby";
+  }
+  if (!Array.isArray(cfg.hideStreamTypes)) {
+    cfg.hideStreamTypes = [];
+  } else {
+    cfg.hideStreamTypes = cfg.hideStreamTypes.filter(v => typeof v === "string");
+  }
+  if (cfg.includeSubtitles !== undefined && typeof cfg.includeSubtitles !== "boolean") {
+    delete cfg.includeSubtitles;
+  }
+
+  // preferredLanguage: optional ISO 639-2/3 code (e.g. "eng", "fre", "ger")
+  // Omit when unconfigured so old URLs keep working
+  if (cfg.preferredLanguage !== undefined) {
+    if (typeof cfg.preferredLanguage !== "string" || !/^[a-z]{2,3}$/i.test(cfg.preferredLanguage.trim())) {
+      delete cfg.preferredLanguage;
+    } else {
+      cfg.preferredLanguage = cfg.preferredLanguage.trim().toLowerCase();
+    }
+  }
+
   return cfg;
 }
 
@@ -225,7 +257,8 @@ app.get("/:cfg/stream/:type/:id.json", async (req, res) => {
   let cfg;
   try {
     cfg = decodeCfg(req.params.cfg);
-  } catch {
+  } catch (err) {
+    console.error("⚠️ Failed to decode config in stream route:", err?.message || String(err));
     return res.json({ streams: [] });
   }
 
@@ -257,7 +290,25 @@ app.get("/:cfg/stream/:type/:id.json", async (req, res) => {
           notWebReady: true, // Default to true for safety
           bingeGroup: `${streamName}-${(s.qualityTitle || "Direct Play").trim()}` // Same stream name+quality = consistent auto-play across episodes
         };
-        
+
+        // videoHash: consistent per-media-source hash for OpenSubtitles cross-device subtitle sync.
+        // Not a real OSDB file hash (we can't read file bytes via Emby API), but provides a
+        // stable identifier so the same media source gets the same subtitles across devices.
+        if (s.itemId && s.mediaSourceId) {
+          behaviorHints.videoHash = crypto
+            .createHash("sha256")
+            .update(`${s.itemId}:${s.mediaSourceId}`)
+            .digest("hex")
+            .slice(0, 16);
+        }
+
+        // proxyHeaders: pass auth token via header for Stremio's streaming server proxy.
+        // Works on Desktop and Android (non-HLS). Stremio Web ignores proxyHeaders,
+        // so api_key is kept in the URL as the primary auth mechanism for compatibility.
+        behaviorHints.proxyHeaders = {
+          request: { "X-Emby-Token": cfg.accessToken }
+        };
+
         return {
           name: streamName, // Use custom stream name from config
           description: s.streamDescription || s.qualityTitle || "Direct Play", // Full detailed technical information
@@ -281,6 +332,76 @@ app.get("/:cfg/stream/:type/:id.json", async (req, res) => {
       console.error("Stack trace:", e.stack);
     }
     res.json({ streams: [] });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// CATALOG route  →  /<cfg>/catalog/<type>/<id>.json
+//     Returns "Continue Watching" items from Emby's Resume endpoint
+// ──────────────────────────────────────────────────────────────────────────
+app.get("/:cfg/catalog/:type/:id.json", async (req, res) => {
+  let cfg;
+  try {
+    cfg = decodeCfg(req.params.cfg);
+  } catch (err) {
+    console.error("⚠️ Failed to decode config in catalog route:", err?.message || String(err));
+    return res.json({ metas: [] });
+  }
+
+  const { type, id } = req.params;
+  if (!cfg.serverUrl || !cfg.userId || !cfg.accessToken)
+    return res.json({ metas: [] });
+
+  const validCatalogs = ["continue-watching-movies", "continue-watching-series"];
+  if (!validCatalogs.includes(id)) return res.json({ metas: [] });
+
+  try {
+    const client = embyClient;
+    const metas = await client.getResumeItems(cfg, type);
+
+    res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.json({ metas: metas || [] });
+  } catch (e) {
+    console.error("Catalog handler error:", e?.message || String(e));
+    if (e?.stack && process.env.NODE_ENV === "development") {
+      console.error("Stack trace:", e.stack);
+    }
+    res.json({ metas: [] });
+  }
+});
+
+app.get("/:cfg/catalog/:type/:id/:extra.json", async (req, res) => {
+  let cfg;
+  try {
+    cfg = decodeCfg(req.params.cfg);
+  } catch (err) {
+    console.error("⚠️ Failed to decode config in catalog route:", err?.message || String(err));
+    return res.json({ metas: [] });
+  }
+
+  const { type, id, extra } = req.params;
+  if (!cfg.serverUrl || !cfg.userId || !cfg.accessToken)
+    return res.json({ metas: [] });
+
+  const validCatalogs = ["continue-watching-movies", "continue-watching-series"];
+  if (!validCatalogs.includes(id)) return res.json({ metas: [] });
+
+  let skip = 0;
+  const skipMatch = extra.match(/skip=(\d+)/);
+  if (skipMatch) skip = parseInt(skipMatch[1], 10);
+
+  try {
+    const client = embyClient;
+    const metas = await client.getResumeItems(cfg, type, skip);
+
+    res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.json({ metas: metas || [] });
+  } catch (e) {
+    console.error("Catalog handler error:", e?.message || String(e));
+    if (e?.stack && process.env.NODE_ENV === "development") {
+      console.error("Stack trace:", e.stack);
+    }
+    res.json({ metas: [] });
   }
 });
 
